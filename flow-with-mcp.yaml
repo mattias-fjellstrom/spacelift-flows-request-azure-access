@@ -1,0 +1,1123 @@
+appInstallations:
+  azure:
+    appName: Azure OIDC
+    appVersion: 0.2.0
+  slack:
+    appName: Slack
+    appVersion: 0.7.0
+blocks:
+  # --- Request -------------------------------------------------------------
+  - name: Access Request
+    description: Fires when someone opens the temporary access form.
+    type:
+      coreBlock: formOpened
+    position: [0, 0]
+  - name: List Resource Groups
+    description: Lists the subscription's resource groups, which the form offers as scopes.
+    type:
+      appBlock:
+        block: httpRequest
+        appInstallation: azure
+    position: [0, 150]
+    inputs:
+      default:
+        links:
+          - block: Access Request
+            output: default
+          - block: Request Azure Access
+            output: invocations
+        config:
+          url: !expr |-
+            `https://management.azure.com/subscriptions/${secrets.AZURE_SUBSCRIPTION_ID}/resourcegroups?api-version=2021-04-01`
+          method: GET
+          serviceName: management
+    errorHandler: Catch Request Errors
+  - name: Form Request?
+    description: Sends requests from the form to the form, and requests from an agent straight to Prepare Request.
+    type:
+      coreBlock: condition
+    position: [0, 300]
+    inputs:
+      default:
+        links:
+          - block: List Resource Groups
+            output: default
+        config:
+          condition: !expr Boolean(outputs.accessRequest)
+  - name: Show Request Form
+    description: Collects the scope, role, duration and justification.
+    type:
+      coreBlock: showForm
+    position: [0, 450]
+    inputs:
+      default:
+        links:
+          - block: Form Request?
+            output: then
+        config:
+          formDefinition:
+            - type: heading
+              heading:
+                level: h2
+                content: Request temporary Azure access
+            - type: text
+              text:
+                content: Access is granted after approval, for a limited time, and removed automatically when the time is up. Every request is recorded.
+            - type: input
+              input:
+                inputType: select
+                identifier: scope
+                label: Scope
+                required: true
+                options: !expr |-
+                  (function() {
+                    const subscription = `/subscriptions/${secrets.AZURE_SUBSCRIPTION_ID}`;
+                    const response = outputs.listResourceGroups;
+                    const groups = response.ok ? (JSON.parse(response.body).value || []) : [];
+                    return [
+                      ...groups
+                        .map((group) => ({ value: group.id, label: `Resource group: ${group.name}` }))
+                        .sort((a, b) => a.label.localeCompare(b.label)),
+                      { value: subscription, label: `Entire subscription` },
+                    ];
+                  })()
+            - type: input
+              input:
+                inputType: select
+                identifier: role
+                label: Role
+                required: true
+                options: !expr |-
+                  JSON.parse(secrets.AZURE_ROLES).map((role) => ({ value: role.id, label: role.name }))
+            - type: input
+              input:
+                inputType: select
+                identifier: duration
+                label: Duration
+                required: true
+                options: !expr |-
+                  [
+                    { value: `10`, label: `10 minutes (for testing)` },
+                    { value: `30`, label: `30 minutes`, isDefault: true },
+                    { value: `60`, label: `1 hour` },
+                    { value: `240`, label: `4 hours` },
+                    { value: `480`, label: `8 hours` },
+                  ]
+            - type: input
+              input:
+                inputType: text
+                identifier: justification
+                label: Justification
+                placeholder: What do you need to do, and why?
+                required: true
+                multiline: true
+            - type: button
+              button:
+                identifier: submit
+                label: Request access
+                variant: primary
+          sessionIdExpr: !expr outputs.accessRequest?.sessionId ?? ``
+  - name: Prepare Request
+    description: Validates a request from the form or from an agent and puts it into one shape that the rest of the flow reads.
+    type:
+      coreBlock: transform
+    position: [0, 600]
+    inputs:
+      default:
+        links:
+          - block: Show Request Form
+            output: interactions
+          - block: Form Request?
+            output: else
+        config: {}
+    outputs:
+      default:
+        outputCustomization: !expr |-
+          (function() {
+            // Only one of the two is upstream of any given event.
+            const agent = outputs.requestAzureAccess;
+            const input = agent
+              ? { ...agent.arguments, duration: agent.arguments?.durationMinutes }
+              : outputs.showRequestForm.formData;
+            const subscription = `/subscriptions/${secrets.AZURE_SUBSCRIPTION_ID}`;
+            const roles = JSON.parse(secrets.AZURE_ROLES);
+            const groups = outputs.listResourceGroups.ok
+              ? (JSON.parse(outputs.listResourceGroups.body).value || [])
+              : [];
+
+            // The scope becomes part of an ARM URL, so it has to be the subscription
+            // or one of the resource groups that Azure listed. Form data can be
+            // tampered with and an agent can pass anything, hence the check against
+            // Azure's own list. An agent may also name a resource group, or say
+            // "subscription"; either way the scope used is the ID that Azure returned.
+            const requested = String(input.scope || ``).trim();
+            const wanted = requested.toLowerCase();
+            const group = groups.find((candidate) => candidate.id.toLowerCase() === wanted || candidate.name.toLowerCase() === wanted);
+            const scope = wanted === `subscription` || wanted === subscription.toLowerCase()
+              ? subscription
+              : group ? group.id : requested;
+            const scopeAllowed = scope === subscription || Boolean(group);
+
+            // The form sends a role ID, an agent usually sends the role's name.
+            const roleWanted = String(input.role || ``).trim().toLowerCase();
+            const role = roles.find((candidate) => candidate.id.toLowerCase() === roleWanted || candidate.name.toLowerCase() === roleWanted);
+            const minutes = Number(input.duration);
+            const justification = String(input.justification || ``).trim();
+            // Flows reports who is signed in to Spacelift, or who authorized the
+            // agent. That is not always how the person is known in Entra ID, so
+            // AZURE_IDENTITIES can map one to the other.
+            const requester = String((agent || outputs.accessRequest)?.user?.email || ``).trim();
+            const identities = new Map(Object.entries(JSON.parse(secrets.AZURE_IDENTITIES)));
+            const azureIdentity = String(identities.get(requester.toLowerCase()) || requester);
+
+            const problems = [
+              !requester && `Flows did not report who is signed in.`,
+              !scopeAllowed && `The scope is not the subscription or one of its resource groups.`,
+              !role && `The role is not one of the roles that can be requested: ${roles.map((candidate) => candidate.name).join(`, `)}.`,
+              ![10, 30, 60, 240, 480].includes(minutes) && `The duration is not one of the offered options: 10, 30, 60, 240 or 480 minutes.`,
+              justification.length < 10 && `The justification must be at least 10 characters.`,
+            ].filter((problem) => typeof problem === `string`);
+
+            const scopeLabel = scope === subscription
+              ? `the entire subscription`
+              : `resource group ${scope.split(`/`).pop()}`;
+            const roleName = role ? role.name : null;
+            // Slack treats <, > and & as markup, so user text is escaped.
+            const escaped = justification.replace(/&/g, `&amp;`).replace(/</g, `&lt;`).replace(/>/g, `&gt;`);
+            // The approver should see who gets the role, not only who asked.
+            const who = azureIdentity === requester ? requester : `${requester} (in Entra ID: ${azureIdentity})`;
+            // And whether a person or their AI agent wrote the request.
+            const via = agent ? `agent` : `form`;
+            const viaLine = agent ? `\n*Requested by:* an AI agent working for the requester, through MCP` : ``;
+
+            return {
+              valid: problems.length === 0,
+              problems,
+              via,
+              requester,
+              azureIdentity,
+              scope,
+              scopeLabel,
+              roleId: role ? role.id : null,
+              roleName,
+              minutes,
+              justification,
+              summary: `:key: *Temporary Azure access request*\n*Requester:* ${who}${viaLine}\n*Role:* ${roleName}\n*Scope:* ${scopeLabel}\n*Duration:* ${minutes} minutes\n*Justification:* ${escaped}`,
+            };
+          })()
+    errorHandler: Catch Request Errors
+  - name: Valid Request?
+    description: Stops requests that fail validation.
+    type:
+      coreBlock: condition
+    position: [0, 750]
+    inputs:
+      default:
+        links:
+          - block: Prepare Request
+            output: default
+        config:
+          condition: !expr outputs.prepareRequest.valid
+  - name: Invalid From Agent?
+    description: Answers an agent through its MCP tool, and a person through the form.
+    type:
+      coreBlock: condition
+    position: [-800, 825]
+    inputs:
+      default:
+        links:
+          - block: Valid Request?
+            output: else
+        config:
+          condition: !expr outputs.prepareRequest.via === `agent`
+  - name: Show Invalid Request
+    description: Tells the requester what was wrong with the request.
+    type:
+      coreBlock: showForm
+    position: [-400, 900]
+    inputs:
+      default:
+        links:
+          - block: Invalid From Agent?
+            output: else
+        config:
+          formDefinition:
+            - type: heading
+              heading:
+                level: h2
+                content: Request not accepted
+            - type: text
+              text:
+                content: !expr |-
+                  `${outputs.prepareRequest.problems.join(` `)} Reload the form to try again.`
+          sessionIdExpr: !expr outputs.accessRequest?.sessionId ?? ``
+  - name: Record Request
+    description: Writes the request to the azure-access-requests table with status pending.
+    type:
+      coreBlock: dataTableCreateRow
+    position: [0, 900]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Valid Request?
+            output: then
+        config:
+          row: !expr |-
+            ({
+              requester: outputs.prepareRequest.requester,
+              scope: outputs.prepareRequest.scope,
+              role_name: outputs.prepareRequest.roleName,
+              role_definition_id: outputs.prepareRequest.roleId,
+              duration_minutes: outputs.prepareRequest.minutes,
+              justification: outputs.prepareRequest.justification,
+              requested_via: outputs.prepareRequest.via,
+              status: `pending`,
+            })
+    errorHandler: Catch Request Errors
+  - name: Submitted From Agent?
+    description: Answers an agent through its MCP tool, and a person through the form.
+    type:
+      coreBlock: condition
+    position: [-800, 975]
+    inputs:
+      default:
+        links:
+          - block: Record Request
+            output: default
+        config:
+          condition: !expr outputs.prepareRequest.via === `agent`
+  - name: Show Submitted
+    description: Confirms to the requester that the request is waiting for approval.
+    type:
+      coreBlock: showForm
+    position: [-400, 1050]
+    inputs:
+      default:
+        links:
+          - block: Submitted From Agent?
+            output: else
+        config:
+          formDefinition:
+            - type: heading
+              heading:
+                level: h2
+                content: Request submitted
+            - type: text
+              text:
+                content: !expr |-
+                  `Your request for ${outputs.prepareRequest.roleName} on ${outputs.prepareRequest.scopeLabel} (${outputs.prepareRequest.minutes} minutes) is waiting for approval. The outcome is posted in Slack.`
+          sessionIdExpr: !expr outputs.accessRequest?.sessionId ?? ``
+
+  # --- Agent tools (MCP) ---------------------------------------------------
+  # Each MCP Tool block is one tool of the flow's MCP server, and its description
+  # is what the agent reads to decide when to call it. Approval can take hours,
+  # so Request Azure Access answers as soon as the request is recorded and the
+  # agent follows up with Check Access Request.
+  - name: List Access Options
+    description: >-
+      Lists what temporary Azure access can be requested: scopes (the subscription
+      and its resource groups), roles and durations. Call this before Request
+      Azure Access when you are not sure which values to pass.
+    type:
+      coreBlock: mcpTool
+    position: [-1200, 0]
+    config: {}
+    inputs:
+      default:
+        links:
+          - block: List Scopes
+            output: default
+          - block: Catch List Options Errors
+            output: default
+        config:
+          responseBody: !expr |-
+            (function() {
+              const all = Object(outputs);
+              if (all.catchListOptionsErrors) {
+                return {
+                  status: `unavailable`,
+                  nextStep: `The flow could not list the Azure access options. The failure was reported to the platform engineer. Ask the user before retrying.`,
+                };
+              }
+              const response = all.listScopes;
+              const groups = response.ok ? (JSON.parse(response.body).value || []) : [];
+              return {
+                subscriptionId: secrets.AZURE_SUBSCRIPTION_ID,
+                scopes: [`subscription`, ...groups.map((group) => group.name).sort((a, b) => a.localeCompare(b))],
+                roles: JSON.parse(secrets.AZURE_ROLES).map((role) => role.name),
+                durationMinutes: [10, 30, 60, 240, 480],
+                guidance: `Ask for the narrowest scope, the least powerful role and the shortest duration that will do the job.`,
+              };
+            })()
+  - name: List Scopes
+    description: Lists the subscription's resource groups for List Access Options.
+    type:
+      appBlock:
+        block: httpRequest
+        appInstallation: azure
+    position: [-1200, 150]
+    inputs:
+      default:
+        links:
+          - block: List Access Options
+            output: invocations
+        config:
+          url: !expr |-
+            `https://management.azure.com/subscriptions/${secrets.AZURE_SUBSCRIPTION_ID}/resourcegroups?api-version=2021-04-01`
+          method: GET
+          serviceName: management
+    errorHandler: Catch List Options Errors
+  - name: Request Azure Access
+    description: >-
+      Asks for temporary access to Azure for the user you work for. Call this when
+      an Azure command or API call fails because of missing permissions (for
+      example AuthorizationFailed or HTTP 403), instead of looking for a way
+      around it. A platform engineer approves or denies the request in Slack, so
+      the access is not there yet when this returns: call Check Access Request
+      with the returned requestId until the status is active, then retry. The
+      access is removed automatically when the duration is up.
+    type:
+      coreBlock: mcpTool
+    position: [-800, 0]
+    config:
+      inputSchema:
+        scope:
+          required: true
+          type:
+            type: string
+            description: The resource group name, or "subscription" for the entire subscription. Prefer a resource group.
+            position: 0
+        role:
+          required: true
+          type:
+            type: string
+            description: The name of an Azure role from List Access Options, for example Reader. Use the least powerful role that will do.
+            position: 1
+        durationMinutes:
+          required: true
+          type:
+            type: integer
+            enum: [10, 30, 60, 240, 480]
+            description: How long the access lasts, in minutes. Use the shortest that will do.
+            position: 2
+        justification:
+          required: true
+          type:
+            type: string
+            description: What you need to do and why, for the person who approves. Name the command or operation that failed. At least 10 characters.
+            position: 3
+    inputs:
+      default:
+        links:
+          - block: Invalid From Agent?
+            output: then
+          - block: Submitted From Agent?
+            output: then
+          - block: Request Error From Agent?
+            output: then
+        config:
+          responseBody: !expr |-
+            (function() {
+              const all = Object(outputs);
+              if (all.catchRequestErrors) {
+                return {
+                  status: `failed`,
+                  nextStep: `The flow failed while handling this request. The failure was reported to the platform engineer. Do not submit a duplicate request until they confirm its outcome.`,
+                };
+              }
+              return all.recordRequest
+                ? {
+                  requestId: all.recordRequest.row.id,
+                  status: `pending`,
+                  role: all.prepareRequest.roleName,
+                  scope: all.prepareRequest.scopeLabel,
+                  durationMinutes: all.prepareRequest.minutes,
+                  nextStep: `A platform engineer has been asked to approve this in Slack. Tell the user, then call Check Access Request with this requestId about once a minute until the status is no longer pending. Nobody has to answer: the request expires after four hours.`,
+                }
+                : {
+                  status: `rejected`,
+                  problems: all.prepareRequest.problems,
+                  nextStep: `Nothing was requested. Fix the problems and call Request Azure Access again. List Access Options shows what can be requested.`,
+                };
+            })()
+  - name: Check Access Request
+    description: >-
+      Returns the status of a request made with Request Azure Access: pending,
+      approved, active (granted, with the time it ends), denied, expired, failed or
+      revoked, and what to do next. Only shows requests of the user you work for.
+    type:
+      coreBlock: mcpTool
+    position: [-1600, 0]
+    config:
+      inputSchema:
+        requestId:
+          required: true
+          type:
+            type: string
+            description: The requestId that Request Azure Access returned.
+            position: 0
+    inputs:
+      default:
+        links:
+          - block: Get Access Request
+            output: default
+          - block: Catch Status Errors
+            output: default
+        config:
+          responseBody: !expr |-
+            (function() {
+              const all = Object(outputs);
+              if (all.catchStatusErrors) {
+                return {
+                  status: `unknown`,
+                  nextStep: `The flow could not check this request. The failure was reported to the platform engineer. Wait for them to confirm recovery, then try this request ID again.`,
+                };
+              }
+              const row = all.getAccessRequest?.rows?.[0]?.row;
+              const caller = String(all.checkAccessRequest.user?.email || ``).trim().toLowerCase();
+              // Requests of other people are reported as unknown, not as forbidden.
+              if (!row || !caller || String(row.requester || ``).trim().toLowerCase() !== caller) {
+                return { status: `unknown`, nextStep: `There is no request with this ID for the user you work for.` };
+              }
+              const nextSteps = {
+                pending: `Waiting for approval in Slack. Check again in about a minute.`,
+                approved: `Approved. The role assignment is being created; check again in a few seconds.`,
+                active: `Granted. Azure can take a few minutes to apply a new role assignment, so if a command still fails with a permission error, wait a minute and retry. Do not ask for more access than this unless the task needs it.`,
+                denied: `Denied. Do not request the same access again; tell the user and ask how to proceed.`,
+                expired: `Nobody decided within four hours. Ask the user before requesting again.`,
+                failed: `Approved, but the access could not be granted. Tell the user; the note says why.`,
+                revoked: `The access has ended. Request it again if the task still needs it.`,
+              };
+              return {
+                requestId: row.id,
+                status: row.status,
+                role: row.role_name,
+                scope: row.scope,
+                durationMinutes: row.duration_minutes,
+                accessExpiresAt: row.access_expires_at || null,
+                note: row.note || null,
+                nextStep: nextSteps[row.status ?? ``] || ``,
+              };
+            })()
+  - name: Get Access Request
+    description: Reads the request that Check Access Request asks about.
+    type:
+      coreBlock: dataTableQueryRows
+    position: [-1600, 150]
+    config:
+      table: azure-access-requests
+      limit: 1
+    inputs:
+      default:
+        links:
+          - block: Check Access Request
+            output: invocations
+        config:
+          filter: !expr |-
+            [{ column: `id`, op: `eq`, value: String(outputs.checkAccessRequest.arguments.requestId || ``).trim() }]
+          queryOrders: !expr |-
+            [{ column: `id`, direction: `DESC` }]
+    errorHandler: Catch Status Errors
+
+  # --- Approval ------------------------------------------------------------
+  - name: Request Approval
+    description: Posts the request to Slack with Approve and Deny buttons. Gives up after four hours.
+    type:
+      appBlock:
+        block: sendMessageWithInteractions
+        appInstallation: slack
+    position: [0, 1050]
+    inputs:
+      default:
+        links:
+          - block: Record Request
+            output: default
+        config:
+          channelId: !expr secrets.SLACK_CHANNEL_ID
+          text: !expr |-
+            `Temporary Azure access request from ${outputs.prepareRequest.requester}`
+          blocks: !expr |-
+            [
+              { type: `section`, text: { type: `mrkdwn`, text: outputs.prepareRequest.summary } },
+              {
+                type: `actions`,
+                elements: [
+                  { type: `button`, text: { type: `plain_text`, text: `Approve` }, style: `primary`, action_id: `approve` },
+                  { type: `button`, text: { type: `plain_text`, text: `Deny` }, style: `danger`, action_id: `deny` },
+                ],
+              },
+            ]
+          timeout: 14400
+    outputs:
+      interaction:
+        # Slack's payload carries its verification token and a reply URL that can
+        # post to the channel. Nothing here uses either, so they are kept out of
+        # the event history.
+        sensitivePaths:
+          - $.token
+          - $.response_url
+    errorHandler: Catch Errors
+  - name: Claim Decision
+    description: Lets only the first of a button press, a second button press, and the time limit through. The time limit fires even after someone has answered.
+    type:
+      coreBlock: memorySet
+    position: [0, 1200]
+    inputs:
+      default:
+        links:
+          - block: Request Approval
+            output: interaction
+          - block: Request Approval
+            output: timeout
+        config:
+          collection: azure-decisions
+          key: !expr outputs.recordRequest.row.id
+          value: !expr |-
+            stored ? stored : ({ claimedAt: new Date().toISOString() })
+          ttl: 86400
+    errorHandler: Catch Errors
+  - name: First Decision?
+    description: The stored value only changes for the first claim.
+    type:
+      coreBlock: condition
+    position: [0, 1350]
+    inputs:
+      default:
+        links:
+          - block: Claim Decision
+            output: default
+        config:
+          condition: !expr outputs.claimDecision.changed
+  - name: Answered?
+    description: Tells a button press from the time limit passing. Only a button press carries actions.
+    type:
+      coreBlock: condition
+    position: [0, 1500]
+    inputs:
+      default:
+        links:
+          - block: First Decision?
+            output: then
+        config:
+          # A button press and the time limit leave Request Approval through
+          # different outputs with different shapes, and the type checker picks
+          # one of the two for every block below. Object(...) reads the event
+          # untyped, here and wherever it is read further on.
+          condition: !expr Boolean(Object(outputs.requestApproval).actions)
+  - name: Approved?
+    description: Routes on the button that was pressed.
+    type:
+      coreBlock: condition
+    position: [0, 1650]
+    inputs:
+      default:
+        links:
+          - block: Answered?
+            output: then
+        config:
+          condition: !expr Object(outputs.requestApproval).actions?.[0]?.action_id === `approve`
+  - name: Record Denial
+    description: Marks the request as denied.
+    type:
+      coreBlock: dataTableUpdateRow
+    position: [-400, 1800]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Approved?
+            output: else
+        config:
+          rowID: !expr outputs.recordRequest.row.id
+          row: !expr |-
+            ({ status: `denied`, approver: Object(outputs.requestApproval).user?.username })
+    errorHandler: Catch Errors
+  - name: Record Expiry
+    description: Marks the request as expired when nobody answered in time.
+    type:
+      coreBlock: dataTableUpdateRow
+    position: [-800, 1650]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Answered?
+            output: else
+        config:
+          rowID: !expr outputs.recordRequest.row.id
+          row: !expr |-
+            ({ status: `expired`, note: `No decision within four hours.` })
+    errorHandler: Catch Errors
+
+  # --- Grant ---------------------------------------------------------------
+  - name: Record Approval
+    description: Marks the request as approved before anything is changed in Azure.
+    type:
+      coreBlock: dataTableUpdateRow
+    position: [0, 1800]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Approved?
+            output: then
+        config:
+          rowID: !expr outputs.recordRequest.row.id
+          row: !expr |-
+            ({ status: `approved`, approver: Object(outputs.requestApproval).user?.username })
+    errorHandler: Catch Errors
+  - name: Find Requester
+    description: Looks the requester up in Entra ID to get the object ID that a role assignment needs.
+    type:
+      appBlock:
+        block: httpRequest
+        appInstallation: azure
+    position: [0, 1950]
+    inputs:
+      default:
+        links:
+          - block: Record Approval
+            output: default
+        config:
+          url: !expr |-
+            (function() {
+              const identity = outputs.prepareRequest.azureIdentity;
+              const quote = (value) => `'${value.replace(/'/g, `''`)}'`;
+              let filter;
+              if (/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity)) {
+                filter = `id eq ${quote(identity)}`;
+              } else {
+                // A guest, or someone who signs in with a personal Microsoft account,
+                // often has no mail, and a user principal name derived from the
+                // address: a@b.com becomes a_b.com#EXT#@<tenant>.onmicrosoft.com.
+                const guest = `${identity.replace(`@`, `_`)}#EXT#@`;
+                filter = `mail eq ${quote(identity)} or userPrincipalName eq ${quote(identity)} or startswith(userPrincipalName, ${quote(guest)})`;
+              }
+              return `https://graph.microsoft.com/v1.0/users?$filter=${encodeURIComponent(filter)}&$select=id,displayName,userPrincipalName`;
+            })()
+          method: GET
+          serviceName: graph
+    errorHandler: Catch Errors
+  - name: Requester Found?
+    description: Continues only when exactly one Entra ID user matches the requester's identity.
+    type:
+      coreBlock: condition
+    position: [0, 2100]
+    inputs:
+      default:
+        links:
+          - block: Find Requester
+            output: default
+        config:
+          condition: !expr |-
+            outputs.findRequester.ok && (JSON.parse(outputs.findRequester.body).value || []).length === 1
+  - name: Create Role Assignment
+    description: Assigns the requested role to the requester at the requested scope.
+    type:
+      appBlock:
+        block: httpRequest
+        appInstallation: azure
+    position: [0, 2250]
+    inputs:
+      default:
+        links:
+          - block: Requester Found?
+            output: then
+        config:
+          url: !expr |-
+            `https://management.azure.com${outputs.prepareRequest.scope}/providers/Microsoft.Authorization/roleAssignments/${crypto.randomUUID()}?api-version=2022-04-01`
+          method: PUT
+          serviceName: management
+          bodyType: json
+          body: !expr |-
+            JSON.stringify({
+              properties: {
+                roleDefinitionId: `/subscriptions/${secrets.AZURE_SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/${outputs.prepareRequest.roleId}`,
+                principalId: JSON.parse(outputs.findRequester.body).value[0].id,
+                principalType: `User`,
+                description: `Temporary access granted by Spacelift Flows, request ${outputs.recordRequest.row.id}`,
+              },
+            })
+    errorHandler: Catch Errors
+  - name: Assignment Created?
+    description: Checks that Azure accepted the role assignment.
+    type:
+      coreBlock: condition
+    position: [0, 2400]
+    inputs:
+      default:
+        links:
+          - block: Create Role Assignment
+            output: default
+        config:
+          condition: !expr outputs.createRoleAssignment.ok
+  - name: Record Failure
+    description: Marks the request as failed when the user lookup or the role assignment did not work.
+    type:
+      coreBlock: dataTableUpdateRow
+    position: [-400, 2550]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Requester Found?
+            output: else
+          - block: Assignment Created?
+            output: else
+        config:
+          rowID: !expr outputs.recordRequest.row.id
+          row: !expr |-
+            ({
+              status: `failed`,
+              note: outputs.createRoleAssignment
+                ? `Azure rejected the role assignment (HTTP ${outputs.createRoleAssignment.statusCode}): ${String(outputs.createRoleAssignment.body).slice(0, 300)}`
+                : `Expected exactly one Entra ID user for ${outputs.prepareRequest.azureIdentity} (lookup returned HTTP ${outputs.findRequester.statusCode}). If the requester is known under another identity in Entra ID, add it to requester_identities.`,
+            })
+    errorHandler: Catch Errors
+  - name: Record Grant
+    description: Marks the request as active and stores what is needed to revoke it later.
+    type:
+      coreBlock: dataTableUpdateRow
+    position: [0, 2550]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Assignment Created?
+            output: then
+        config:
+          rowID: !expr outputs.recordRequest.row.id
+          row: !expr |-
+            (function() {
+              const assignment = JSON.parse(outputs.createRoleAssignment.body);
+              return {
+                status: `active`,
+                principal_id: assignment.properties.principalId,
+                role_assignment_id: assignment.id,
+                access_expires_at: new Date(Date.now() + outputs.prepareRequest.minutes * 60000).toISOString(),
+                slack_ts: Object(outputs.requestApproval).container?.message_ts,
+              };
+            })()
+    errorHandler: Catch Errors
+  - name: Close Approval Message
+    description: Replaces the buttons on the Slack message with the outcome, whichever way the request ended.
+    type:
+      appBlock:
+        block: updateMessageBlocks
+        appInstallation: slack
+    position: [-400, 2700]
+    inputs:
+      default:
+        links:
+          - block: Record Grant
+            output: default
+          - block: Record Denial
+            output: default
+          - block: Record Failure
+            output: default
+          - block: Record Expiry
+            output: default
+        config:
+          channelId: !expr secrets.SLACK_CHANNEL_ID
+          ts: !expr |-
+            Object(outputs.requestApproval).ts || Object(outputs.requestApproval).container?.message_ts
+          text: !expr |-
+            `Temporary Azure access request from ${outputs.prepareRequest.requester}`
+          blocks: !expr |-
+            (function() {
+              const approval = Object(outputs.requestApproval);
+              const decidedBy = approval.user ? `<@${approval.user.id}>` : `nobody`;
+              let outcome;
+              if (outputs.recordGrant) {
+                outcome = `:white_check_mark: Approved by ${decidedBy}. The access expires at ${outputs.recordGrant.row.access_expires_at} and is removed automatically.`;
+              } else if (outputs.recordDenial) {
+                outcome = `:no_entry: Denied by ${decidedBy}.`;
+              } else if (outputs.recordFailure) {
+                outcome = `:warning: Approved by ${decidedBy}, but the access could not be granted. ${outputs.recordFailure.row.note}`;
+              } else {
+                outcome = `:hourglass: Nobody answered within four hours, so the request expired.`;
+              }
+              return [
+                { type: `section`, text: { type: `mrkdwn`, text: outputs.prepareRequest.summary } },
+                { type: `context`, elements: [{ type: `mrkdwn`, text: outcome }] },
+              ];
+            })()
+    errorHandler: Catch Errors
+
+  # --- Revoke --------------------------------------------------------------
+  - name: Wait For Expiry
+    description: Holds the event until the granted time is up. It starts from the role assignment, not from the audit record, so that access is revoked even if recording the grant failed.
+    type:
+      coreBlock: sleep
+    position: [0, 2700]
+    inputs:
+      default:
+        links:
+          - block: Assignment Created?
+            output: then
+        config:
+          sleep: !expr outputs.prepareRequest.minutes * 60
+  - name: Grant To Revoke
+    description: Gives the timer path and the sweep path one shape, so both use the same revoke blocks.
+    type:
+      coreBlock: transform
+    position: [0, 2850]
+    inputs:
+      default:
+        links:
+          - block: Wait For Expiry
+            output: default
+          - block: Each Overdue Grant
+            output: default
+        config: {}
+    outputs:
+      default:
+        outputCustomization: !expr |-
+          (function() {
+            // The sweep carries the grant as a table row, the timer path still has
+            // the original request upstream. An output expression sees every
+            // upstream block as optional, hence the ?. on the timer path.
+            const overdue = outputs.eachOverdueGrant?.item;
+            if (overdue) {
+              return {
+                rowId: overdue.id,
+                roleAssignmentId: overdue.role_assignment_id,
+                requester: overdue.requester,
+                roleName: overdue.role_name,
+                threadTs: overdue.slack_ts || undefined,
+                trigger: `sweep`,
+              };
+            }
+            return {
+              rowId: outputs.recordRequest?.row.id,
+              roleAssignmentId: JSON.parse(outputs.createRoleAssignment?.body ?? `{}`).id,
+              requester: outputs.prepareRequest?.requester,
+              roleName: outputs.prepareRequest?.roleName,
+              threadTs: Object(outputs.requestApproval).container?.message_ts,
+              trigger: `timer`,
+            };
+          })()
+    errorHandler: Catch Errors
+  - name: Revoke Access
+    description: Deletes the role assignment.
+    type:
+      appBlock:
+        block: httpRequest
+        appInstallation: azure
+    position: [0, 3000]
+    inputs:
+      default:
+        links:
+          - block: Grant To Revoke
+            output: default
+        config:
+          url: !expr |-
+            `https://management.azure.com${outputs.grantToRevoke.roleAssignmentId}?api-version=2022-04-01`
+          method: DELETE
+          serviceName: management
+    errorHandler: Catch Errors
+  - name: Revoked?
+    description: Azure answers 200 when it deleted the assignment and 204 when it was already gone. Both count.
+    type:
+      coreBlock: condition
+    position: [0, 3150]
+    inputs:
+      default:
+        links:
+          - block: Revoke Access
+            output: default
+        config:
+          condition: !expr outputs.revokeAccess.ok
+  - name: Record Revocation
+    description: Marks the grant as revoked.
+    type:
+      coreBlock: dataTableUpdateRow
+    position: [0, 3300]
+    config:
+      table: azure-access-requests
+    inputs:
+      default:
+        links:
+          - block: Revoked?
+            output: then
+        config:
+          rowID: !expr outputs.grantToRevoke.rowId ?? ``
+          row: !expr |-
+            ({ status: `revoked`, note: `Revoked by the ${outputs.grantToRevoke.trigger} at ${new Date().toISOString()}.` })
+    errorHandler: Catch Errors
+  - name: Notify Revoked
+    description: Confirms in the Slack thread that the access is gone.
+    type:
+      appBlock:
+        block: sendTextMessage
+        appInstallation: slack
+    position: [0, 3450]
+    inputs:
+      default:
+        links:
+          - block: Record Revocation
+            output: default
+        config:
+          channelId: !expr secrets.SLACK_CHANNEL_ID
+          threadTs: !expr outputs.grantToRevoke.threadTs
+          text: !expr |-
+            `:lock: Temporary access ended: *${outputs.grantToRevoke.roleName}* for *${outputs.grantToRevoke.requester}* has been removed.`
+    errorHandler: Catch Errors
+  - name: Report Revoke Failure
+    description: Raises the alarm when a role assignment could not be removed. The grant stays active, so the sweep tries again.
+    type:
+      appBlock:
+        block: sendTextMessage
+        appInstallation: slack
+    position: [-400, 3300]
+    inputs:
+      default:
+        links:
+          - block: Revoked?
+            output: else
+        config:
+          channelId: !expr secrets.SLACK_CHANNEL_ID
+          threadTs: !expr outputs.grantToRevoke.threadTs
+          text: !expr |-
+            `:rotating_light: Could not remove *${outputs.grantToRevoke.roleName}* for *${outputs.grantToRevoke.requester}* (HTTP ${outputs.revokeAccess.statusCode}). The access is still in place. The hourly sweep will try again; remove \`${outputs.grantToRevoke.roleAssignmentId}\` by hand if this keeps failing.`
+    errorHandler: Catch Errors
+
+  # --- Safety net ----------------------------------------------------------
+  - name: Expiry Sweep
+    description: Runs every hour to catch grants whose timer never fired, for example because the flow was edited or disabled.
+    type:
+      coreBlock: schedule
+    position: [400, 2400]
+    config:
+      definition:
+        type: frequency
+        frequency:
+          interval: 1
+          unit: hours
+  - name: Find Active Grants
+    description: Reads every grant that is still marked active.
+    type:
+      coreBlock: dataTableQueryRows
+    position: [400, 2550]
+    config:
+      table: azure-access-requests
+      limit: 100
+    inputs:
+      default:
+        links:
+          - block: Expiry Sweep
+            output: default
+        config:
+          filter: !expr |-
+            [{ column: `status`, op: `eq`, value: `active` }]
+          queryOrders: !expr |-
+            [{ column: `access_expires_at`, direction: `ASC` }]
+    errorHandler: Catch Errors
+  - name: Each Overdue Grant
+    description: Emits one event per grant that expired more than five minutes ago. The margin keeps the sweep out of the timer's way.
+    type:
+      coreBlock: explode
+    position: [400, 2700]
+    inputs:
+      default:
+        links:
+          - block: Find Active Grants
+            output: default
+        config:
+          items: !expr |-
+            (outputs.findActiveGrants.rows || [])
+              .map((entry) => entry.row)
+              .filter((row) => row.role_assignment_id && Date.parse(row.access_expires_at ?? ``) + 300000 < Date.now())
+          emittedLimit: 100
+
+  # --- Errors --------------------------------------------------------------
+  - name: Catch List Options Errors
+    description: Returns failures in the options tool to its active agent invocation.
+    type:
+      coreBlock: handleError
+    position: [800, 300]
+  - name: Catch Request Errors
+    description: Catches failures before an access request is recorded so agent requests can be answered.
+    type:
+      coreBlock: handleError
+    position: [800, 450]
+  - name: Request Error From Agent?
+    description: Only answers request errors made through MCP; a form has no MCP invocation to answer.
+    type:
+      coreBlock: condition
+    position: [-400, 450]
+    inputs:
+      default:
+        links:
+          - block: Catch Request Errors
+            output: default
+        config:
+          condition: !expr Boolean(Object(outputs).requestAzureAccess)
+  - name: Catch Status Errors
+    description: Returns failures in the status tool to its active agent invocation.
+    type:
+      coreBlock: handleError
+    position: [800, 600]
+  - name: Catch Errors
+    description: Receives the error when any block that names it as error handler fails.
+    type:
+      coreBlock: handleError
+    position: [800, 0]
+  - name: Report Error
+    description: Posts the failure to Slack so it never goes unnoticed.
+    type:
+      appBlock:
+        block: sendTextMessage
+        appInstallation: slack
+    position: [800, 150]
+    inputs:
+      default:
+        links:
+          - block: Catch Errors
+            output: default
+          - block: Catch List Options Errors
+            output: default
+          - block: Catch Request Errors
+            output: default
+          - block: Catch Status Errors
+            output: default
+        config:
+          channelId: !expr secrets.SLACK_CHANNEL_ID
+          text: !expr |-
+            (function() {
+              // The checker types a Handle Error block's outputs as never.
+              const all = Object(outputs);
+              const failure = all.catchErrors
+                || all.catchListOptionsErrors
+                || all.catchRequestErrors
+                || all.catchStatusErrors;
+              const raw = failure.error && failure.error.message ? failure.error.message : JSON.stringify(failure.error);
+              const message = raw.split(`\n`).filter((line) => !line.trim().startsWith(`at `)).join(`\n`).trim();
+              const request = all.prepareRequest;
+              const context = request ? ` while handling the request from ${request.requester} for ${request.roleName} on ${request.scopeLabel}` : ``;
+              return `:rotating_light: The temporary access flow failed${context} (${failure.operation}). ${message}`;
+            })()
+notes:
+  - body: |-
+      # Azure Access Requests
+
+      1. **Request**: a form, or an AI agent through the flow's MCP tools, asks for scope, role, duration and justification.
+      2. **Approval**: Slack buttons, with a four hour limit.
+      3. **Grant**: the requester is looked up in Entra ID and gets a role assignment.
+      4. **Revoke**: a timer removes the assignment when the time is up.
+      5. **Safety net**: an hourly sweep removes anything the timer missed.
+
+      Every step is written to the `azure-access-requests` data table. Agents follow
+      their request with the Check Access Request tool.
+    position: [400, 0]
+    style:
+      width: 360
+      height: 360
+      color: '#18181b'

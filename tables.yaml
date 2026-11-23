@@ -1,0 +1,33 @@
+dataTables:
+  azure-access-requests:
+    name: azure-access-requests
+    schema:
+      columns:
+        - name: requester
+          type: string
+        - name: scope
+          type: string
+        - name: role_name
+          type: string
+        - name: role_definition_id
+          type: string
+        - name: duration_minutes
+          type: integer
+        - name: justification
+          type: string
+        - name: requested_via
+          type: string
+        - name: status
+          type: string
+        - name: approver
+          type: string
+        - name: principal_id
+          type: string
+        - name: role_assignment_id
+          type: string
+        - name: access_expires_at
+          type: string
+        - name: slack_ts
+          type: string
+        - name: note
+          type: string

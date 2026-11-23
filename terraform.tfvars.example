@@ -1,0 +1,22 @@
+flows_project_id = "00000000-0000-0000-0000-000000000000"
+rollout_stage     = 1
+slack_channel_id  = "REPLACE_WITH_SLACK_CHANNEL_ID"
+# Set this when rollout_stage changes to 2.
+subscription_id   = "00000000-0000-0000-0000-000000000000"
+
+# Add these after the first apply and the guided Slack app setup.
+# slack_bot_token      = "xoxb-..."
+# slack_signing_secret = "..."
+
+# Optional. These are the defaults.
+# assignable_roles = ["Reader", "Storage Blob Data Reader", "Contributor"]
+# enable_agent_mcp = false
+
+# Optional. Use this when Flows knows someone under a different address than
+# Entra ID does.
+# requester_identities = {
+#   "jane-doe@example.app.spacelift.io" = "jane.doe@example.com"
+# }
+
+# Add this after the first apply, using the URL shown by the Azure app installation.
+# flows_oidc_issuer_url = "https://..."
