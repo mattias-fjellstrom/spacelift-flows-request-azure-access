@@ -1,9 +1,13 @@
 # Azure Access Requests with Spacelift Flows
 
+![](./assets/cover.png)
+
 This OpenTofu example deploys a Spacelift Flow that handles temporary Azure
 access requests. A developer requests access, a platform engineer approves it
 in Slack, and the flow assigns and later revokes the Azure role. Requests are
 recorded in a Flows data table.
+
+See the accompanying blog post at [mattias.engineer](https://mattias.engineer/blog/2026/spacelift-flows-request-azure-access/).
 
 ## Prerequisites
 
